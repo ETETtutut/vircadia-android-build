@@ -221,8 +221,8 @@ jobs:
       - name: Environment
         run: |
           set -euxo pipefail
-          export JAVA_HOME_8="${{ steps.jdk8.outputs.java-home }}"
-          export JAVA_HOME_TOOLS="${{ steps.jdktools.outputs.java-home }}"
+          export JAVA_HOME_8="${{ steps.jdk8.outputs.path }}"
+          export JAVA_HOME_TOOLS="${{ steps.jdktools.outputs.path }}"
           bash scripts/ci/env.sh
 
       # ---------------------------------------------------------------------
@@ -231,14 +231,14 @@ jobs:
       # operator-supplied zip; otherwise stops. It never invents a URL.
       - name: Bootstrap the Android command-line tools
         env:
-          JAVA_HOME: ${{ steps.jdktools.outputs.java-home }}
+          JAVA_HOME: ${{ steps.jdktools.outputs.path }}
         run: |
           set -euxo pipefail
           bash scripts/ci/cmdline_tools.sh
 
       - name: Install Android SDK, NDK and CMake
         env:
-          JAVA_HOME: ${{ steps.jdktools.outputs.java-home }}
+          JAVA_HOME: ${{ steps.jdktools.outputs.path }}
         run: |
           set -euxo pipefail
           bash scripts/ci/sdk.sh "$PWD/core"
@@ -319,10 +319,10 @@ jobs:
 
       - name: Build the APK
         env:
-          JAVA_HOME: ${{ steps.jdk8.outputs.java-home }}
+          JAVA_HOME: ${{ steps.jdk8.outputs.path }}
         run: |
           set -euxo pipefail
-          export JAVA_HOME="${{ steps.jdk8.outputs.java-home }}"
+          export JAVA_HOME="${{ steps.jdk8.outputs.path }}"
           export PATH="$JAVA_HOME/bin:$PATH"
           bash scripts/ci/build.sh "$PWD"
 
