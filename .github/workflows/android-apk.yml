@@ -1,0 +1,408 @@
+# Build a genuine native Vircadia Android APK.
+#
+# Manual only. Nothing here runs on push, because the toolchain download is
+# multi-GB and the build is long.
+#
+# EVERY STEP IN THIS FILE IS [WROTE-UNRUN]. It has never been executed. The
+# first run is expected to fail somewhere in the native build; the point of the
+# logging and the always-uploaded artefacts is that the failure is diagnosable.
+#
+# Free standard runner. timeout-minutes: 360.
+
+name: android-apk
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: "Vircadia core git ref (branch, tag or SHA)"
+        required: false
+        default: "master"
+      content_ref:
+        description: "Vircadia content git ref"
+        required: false
+        default: "master"
+      runner:
+        description: "Runner label. ubuntu-22.04 is closest to the Ubuntu 18.04 host the archives were built on."
+        required: false
+        default: "ubuntu-22.04"
+      ndk_version:
+        description: "Android NDK version (BUILD_ANDROID.md asks for 18 or higher)"
+        required: false
+        default: "18.1.5063045"
+      gvr_mode:
+        description: "com.google.vr resolution. 'maven' resolves normally and FAILS EARLY if nothing serves 1.80.0. 'local-aar' is NOT IMPLEMENTED and is rejected."
+        required: false
+        default: "maven"
+        type: choice
+        options: ["maven", "local-aar"]
+      allow_unresolved_gvr:
+        description: "Downgrade the GVR resolution failure to a warning (only if you deliberately want to push past it)."
+        required: false
+        default: false
+        type: boolean
+      asset_transport:
+        description: "External asset transport. Must exist in ExternalAssetsConfig.cmake or the run fails; never silently substituted."
+        required: false
+        default: "skip"
+        type: choice
+        options: ["skip", "direct", "ipfs"]
+      cmdline_tools_zip_url:
+        description: "Only needed if the runner has no Android SDK. Official 'Command line tools only' Linux zip from https://developer.android.com/studio#command-tools"
+        required: false
+        default: ""
+      include_daybreak:
+        description: "Include the Daybreak world pack in the APK"
+        required: false
+        default: true
+        type: boolean
+      cache_precompiled:
+        description: "Cache HIFI_ANDROID_PRECOMPILED (multi-GB). Turn off if the 10 GB cache cap rejects the save."
+        required: false
+        default: true
+        type: boolean
+      build_variant:
+        description: "Gradle variant"
+        required: false
+        default: "release"
+        type: choice
+        options: ["release", "debug"]
+
+env:
+  CORE_REPO: "https://github.com/vircadia/vircadia.git"
+  CONTENT_REPO: "https://github.com/vircadia/vircadia-content.git"
+  BUILD_VARIANT: ${{ github.event.inputs.build_variant }}
+  GVR_MODE: ${{ github.event.inputs.gvr_mode }}
+  GVR_ALLOW_UNRESOLVED: ${{ github.event.inputs.allow_unresolved_gvr == 'true' && '1' || '0' }}
+  CMDLINE_TOOLS_ZIP_URL: ${{ github.event.inputs.cmdline_tools_zip_url }}
+  ASSET_TRANSPORT_REQUESTED: ${{ github.event.inputs.asset_transport }}
+  ANDROID_NDK_VERSION: ${{ github.event.inputs.ndk_version }}
+
+jobs:
+  build:
+    name: build android apk
+    runs-on: ${{ github.event.inputs.runner }}
+    timeout-minutes: 360
+
+    steps:
+      # ---------------------------------------------------------------------
+      - name: Checkout the overlay repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ---------------------------------------------------------------------
+      - name: Reclaim disk space
+        run: |
+          set -euxo pipefail
+          df -h
+          sudo rm -rf /usr/share/dotnet || true
+          # /usr/local/lib/android is deliberately NOT deleted. It is where the
+          # runner image keeps the Android SDK and cmdline-tools, and an earlier
+          # revision removed it and then expected sdkmanager to be on PATH.
+          # Deleting it is only safe once an alternative toolchain is in place;
+          # none is, so it stays.
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          # Safe: this runs before setup-java, which repopulates the tool cache.
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+          sudo apt-get clean || true
+          df -h
+
+      # ---------------------------------------------------------------------
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          # NOTE [WROTE-UNRUN]: reconciled against the Vircadia Linux host-tools
+          # dependency set, NOT against BUILD_LINUX.md (which was not read when
+          # this was written). A surplus package is harmless; a missing one
+          # fails loudly at cmake configure time.
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            git curl wget unzip zip xz-utils file \
+            python3 python3-pip python3-venv \
+            libssl-dev zlib1g-dev \
+            libgl1-mesa-dev libglu1-mesa-dev libegl1-mesa-dev \
+            libx11-dev libxext-dev libxrender-dev libxi-dev libxrandr-dev \
+            libxcursor-dev libxinerama-dev libxfixes-dev \
+            libasound2-dev libpulse-dev libudev-dev libbluetooth-dev \
+            libv4l-dev libusb-1.0-0-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libtbb-dev patchelf
+
+      # ---------------------------------------------------------------------
+      # Gradle 4.10.1 needs JDK 8. The Android cmdline-tools need a newer JDK,
+      # so both are installed and JAVA_HOME is switched per step (C1).
+      - name: Set up JDK 8 for Gradle
+        id: jdk8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Set up a newer JDK for the Android command line tools
+        id: jdktools
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ---------------------------------------------------------------------
+      # Restore before anything downloads, save after. The caches are keyed on
+      # the asset config and the overlay so a changed pin invalidates them.
+      - name: Compute cache keys
+        id: keys
+        run: |
+          set -euxo pipefail
+          HASH="$(find scripts overlay .github -type f -print0 2>/dev/null \
+                  | sort -z | xargs -0 -r sha256sum | sha256sum | cut -c1-16)"
+          printf 'overlay=%s\n' "$HASH" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event.inputs.cache_precompiled }}" = "true" ]; then
+            printf 'precompiled=hifi_externals\n/mnt/hifi_externals\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'precompiled=\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore caches
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ${{ steps.keys.outputs.precompiled }}
+          key: vircadia-android-${{ runner.os }}-${{ steps.keys.outputs.overlay }}-${{ github.event.inputs.ndk_version }}
+
+      # ---------------------------------------------------------------------
+      - name: Fetch CORE
+        run: |
+          set -euxo pipefail
+          if [ -d core/.git ]; then
+            echo "using the vendored core/ directory"
+            git -C core rev-parse HEAD
+          else
+            # A ZIP snapshot is not enough: it lacks submodule content such as
+            # libraries/networking/src/acme, so clone with submodules.
+            git clone --depth 1 --recurse-submodules --shallow-submodules \
+              --branch "${{ github.event.inputs.core_ref }}" \
+              "${CORE_REPO}" core
+            git -C core rev-parse HEAD
+            git -C core submodule status
+          fi
+
+      - name: Fetch CONTENT (sparse)
+        if: ${{ github.event.inputs.include_daybreak == 'true' }}
+        run: |
+          set -euxo pipefail
+          if [ -d content/.git ]; then
+            echo "using the vendored content/ directory"
+          else
+            git clone --filter=blob:none --no-checkout --depth 1 \
+              --branch "${{ github.event.inputs.content_ref }}" \
+              "${CONTENT_REPO}" content
+            git -C content sparse-checkout init --cone
+            # The Daybreak world plus the serverless tutorial assets. Refined
+            # per-run by world/needed-content-paths.txt, which build_world.py
+            # writes and the summary prints.
+            git -C content sparse-checkout set \
+              Bazaar/Worlds/Daybreak DomainContent/Tutorial
+            git -C content checkout
+          fi
+          du -sh content
+          find content -maxdepth 3 -type d | head -40
+
+      # ---------------------------------------------------------------------
+      - name: Environment
+        run: |
+          set -euxo pipefail
+          export JAVA_HOME_8="${{ steps.jdk8.outputs.java-home }}"
+          export JAVA_HOME_TOOLS="${{ steps.jdktools.outputs.java-home }}"
+          bash scripts/ci/env.sh
+
+      # ---------------------------------------------------------------------
+      # Make sdkmanager exist BEFORE sdk.sh requires it. Reuses an existing
+      # toolchain when the image provides one; otherwise installs from the
+      # operator-supplied zip; otherwise stops. It never invents a URL.
+      - name: Bootstrap the Android command-line tools
+        env:
+          JAVA_HOME: ${{ steps.jdktools.outputs.java-home }}
+        run: |
+          set -euxo pipefail
+          bash scripts/ci/cmdline_tools.sh
+
+      - name: Install Android SDK, NDK and CMake
+        env:
+          JAVA_HOME: ${{ steps.jdktools.outputs.java-home }}
+        run: |
+          set -euxo pipefail
+          bash scripts/ci/sdk.sh "$PWD/core"
+
+      # ---------------------------------------------------------------------
+      - name: Preflight asset URLs and the asset transport
+        run: |
+          set -euxo pipefail
+          bash scripts/ci/preflight.sh "$PWD/core" "${ASSET_TRANSPORT_REQUESTED:-skip}"
+
+      - name: Probe GVR java dependencies
+        run: |
+          set -euxo pipefail
+          bash scripts/ci/gvr.sh "$PWD/core"
+
+      # ---------------------------------------------------------------------
+      # The effective transport is whatever preflight proved is possible. It is
+      # never rewritten here: if the request could not be honoured, preflight
+      # already failed. `:?` makes a missing value an error rather than a
+      # silent fall back to skip.
+      - name: Apply the overlay patches
+        run: |
+          set -euxo pipefail
+          EFF="${ASSET_TRANSPORT_EFFECTIVE:?preflight did not publish ASSET_TRANSPORT_EFFECTIVE}"
+          echo "asset transport requested=${ASSET_TRANSPORT_REQUESTED:-skip} effective=${EFF}"
+          bash scripts/apply-overlay.sh --apply "$PWD/core" --transport "$EFF"
+
+      - name: Verify the overlay patches
+        run: |
+          set -euxo pipefail
+          EFF="${ASSET_TRANSPORT_EFFECTIVE:?preflight did not publish ASSET_TRANSPORT_EFFECTIVE}"
+          bash scripts/apply-overlay.sh --verify "$PWD/core" --transport "$EFF"
+
+      - name: Validate avatar and animation assets
+        run: |
+          set -euxo pipefail
+          mkdir -p reports
+          python3 -I scripts/validate_assets.py --core "$PWD/core" \
+            --report reports/asset-validation.json
+
+      # ---------------------------------------------------------------------
+      - name: Build the Daybreak world pack
+        if: ${{ github.event.inputs.include_daybreak == 'true' }}
+        run: |
+          set -euxo pipefail
+          python3 -I scripts/build_world.py --content "$PWD/content" \
+            --repo "$PWD" --mode ci \
+            --assets-dir "$PWD/core/android/apps/interface/src/main/assets/world"
+          {
+            echo "### Daybreak world pack"
+            echo ""
+            echo '```'
+            head -40 world/needed-content-paths.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------------
+      - name: Generate the throwaway keystore and Gradle properties
+        run: |
+          set -euxo pipefail
+          KEYSTORE="$RUNNER_TEMP/throwaway.jks"
+          keytool -genkeypair -v \
+            -keystore "$KEYSTORE" \
+            -storepass throwaway -keypass throwaway \
+            -alias key0 -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=CI, OU=CI, O=CI, L=CI, S=CI, C=CI"
+          mkdir -p "$HOME/.gradle"
+          cat > "$HOME/.gradle/gradle.properties" <<EOF
+          HIFI_ANDROID_PRECOMPILED=${HIFI_ANDROID_PRECOMPILED}
+          HIFI_ANDROID_KEYSTORE=${KEYSTORE}
+          HIFI_ANDROID_KEYSTORE_PASSWORD=throwaway
+          HIFI_ANDROID_KEY_ALIAS=key0
+          HIFI_ANDROID_KEY_PASSWORD=throwaway
+          SUPPRESS_QUEST_INTERFACE
+          SUPPRESS_QUEST_FRAME_PLAYER
+          EOF
+          sed 's/^/    /' "$HOME/.gradle/gradle.properties"
+
+      - name: Build the APK
+        env:
+          JAVA_HOME: ${{ steps.jdk8.outputs.java-home }}
+        run: |
+          set -euxo pipefail
+          export JAVA_HOME="${{ steps.jdk8.outputs.java-home }}"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          bash scripts/ci/build.sh "$PWD"
+
+      # ---------------------------------------------------------------------
+      # Saved even when the run failed, so a failed job does not throw away the
+      # multi-GB dependency downloads.
+      - name: Save caches
+        if: always()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ${{ steps.keys.outputs.precompiled }}
+          key: vircadia-android-${{ runner.os }}-${{ steps.keys.outputs.overlay }}-${{ github.event.inputs.ndk_version }}
+
+      # ---------------------------------------------------------------------
+      # Hard-fails only when the APK is missing, is not a valid zip, or lacks
+      # lib/arm64-v8a/libnative-lib.so. The upload steps below use
+      # if: always(), so a failure here still publishes the artefacts.
+      - name: Verify the APK
+        if: always()
+        run: |
+          set -euxo pipefail
+          # build.sh selects exactly one APK for the requested variant and
+          # records it here. No `find | head -1`: filesystem order must never
+          # decide which APK is verified or uploaded.
+          if [ ! -f artifacts/apk-path.txt ]; then
+            echo "FAIL: artifacts/apk-path.txt is missing - build.sh recorded no APK." >&2
+            echo "      The build did not get far enough to select one. See the" >&2
+            echo "      build-logs artifact and gradle-pass*-*.log." >&2
+            exit 1
+          fi
+          APK="$(cat artifacts/apk-path.txt)"
+          echo "verifying: $APK"
+          bash scripts/ci/verify_apk.sh "$APK" "$PWD"
+
+      - name: Upload the APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vircadia-android-apk
+          if-no-files-found: warn
+          path: |
+            artifacts/**/*.apk
+            artifacts/apk-path.txt
+            apk-report.txt
+            reports/*.json
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          if-no-files-found: warn
+          path: |
+            build-logs/**
+            preflight-report.txt
+            gvr-report.txt
+            reports/**
+            core/android/apps/interface/build/outputs/logs/**
+            core/android/**/build/reports/**
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## Vircadia Android APK build"
+            echo ""
+            echo "- runner: \`${{ github.event.inputs.runner }}\`"
+            echo "- core_ref: \`${{ github.event.inputs.core_ref }}\`"
+            echo "- content_ref: \`${{ github.event.inputs.content_ref }}\`"
+            echo "- ndk: \`${{ github.event.inputs.ndk_version }}\`"
+            echo "- gvr_mode: \`${{ github.event.inputs.gvr_mode }}\`"
+            echo "- asset_transport: \`${{ github.event.inputs.asset_transport }}\` (effective: \`${ASSET_TRANSPORT_EFFECTIVE:-unknown}\`)"
+            echo "- include_daybreak: \`${{ github.event.inputs.include_daybreak }}\`"
+            echo "- variant: \`${{ github.event.inputs.build_variant }}\`"
+            echo ""
+            if [ -f apk-report.txt ]; then
+              echo "### APK report"
+              echo ""
+              echo '```'
+              cat apk-report.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,41 @@
+# Build output
+build/
+artifacts/
+build-logs/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.o
+*.so
+*.sym
+
+# Self-test staging (a throwaway copy of a handful of source files)
+selftest/
+
+# Gradle / Android
+.gradle/
+local.properties
+*.jks
+*.keystore
+
+# Generated world payload: the JSON and maps are tracked, the assets are not
+world/assets/
+world/**.fbx
+world/**.glb
+world/**.png
+world/**.jpg
+
+# Trees fetched by CI (or vendored deliberately and thus not ignored by hand)
+/core/
+/content/
+hifi_externals/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS
+.DS_Store
+*.swp
