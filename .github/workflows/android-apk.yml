@@ -160,7 +160,11 @@ jobs:
                   | sort -z | xargs -0 -r sha256sum | sha256sum | cut -c1-16)"
           printf 'overlay=%s\n' "$HASH" >> "$GITHUB_OUTPUT"
           if [ "${{ github.event.inputs.cache_precompiled }}" = "true" ]; then
-            printf 'precompiled=hifi_externals\n/mnt/hifi_externals\n' >> "$GITHUB_OUTPUT"
+            {
+              echo 'precompiled<<EOF'
+              printf '%s\n' 'hifi_externals' '/mnt/hifi_externals'
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
           else
             printf 'precompiled=\n' >> "$GITHUB_OUTPUT"
           fi
